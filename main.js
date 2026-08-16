@@ -25,7 +25,7 @@ const renderer = new THREE.WebGLRenderer();
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 0.2; // control the overall brightness of the scene
+renderer.toneMappingExposure = 0.7; // control the overall brightness of the scene
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
@@ -98,7 +98,7 @@ const loader = new GLTFLoader(); // Create a GLTFLoader instance (only once, out
 
 const modelUrl = "models/snowy-mountain.glb"; // Specify the path to your GLTF model
 
-const loadedModel = await loadModel(
+const terrain = await loadModel(
   loader,
   modelUrl,
   2400,
@@ -108,10 +108,24 @@ const loadedModel = await loadModel(
   { animationPlaybackRate: ANIMATION_PLAYBACK_RATE },
 );
 
-if (loadedModel !== null) {
-  mixer = loadedModel.mixer;
+if (terrain !== null) {
+  mixer = terrain.mixer;
 }
 
+const charModelUrl = "/characters/wolf.glb"; // Specify the path to your GLTF model
+const character = await loadModel(
+  loader,
+  charModelUrl,
+  1,
+  { x: 0, y: -14, z: -20 },
+  scene,
+  physics,
+  { animationPlaybackRate: ANIMATION_PLAYBACK_RATE },
+);
+
+if (character !== null) {
+  mixer = character.mixer;
+}
 //responsive canvas
 window.addEventListener("resize", onWindowResize);
 
