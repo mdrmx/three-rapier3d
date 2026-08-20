@@ -19,7 +19,8 @@ const camera = new THREE.PerspectiveCamera(
   0.1,
   3000,
 );
-camera.position.set(0, 5, 8);
+camera.position.set(0, -3, 5);
+let cameraAngle = 0; // smoothed azimuthal angle (radians) around the character
 
 const renderer = new THREE.WebGLRenderer();
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -29,6 +30,9 @@ renderer.toneMappingExposure = 0.7; // control the overall brightness of the sce
 document.body.appendChild(renderer.domElement);
 
 const controls = new OrbitControls(camera, renderer.domElement);
+// The third-person follow camera below drives position/rotation directly,
+// which fights OrbitControls if both are active
+controls.enabled = false;
 
 ///////ENVIRONMENT (HDR SKY)////////
 const pmremGenerator = new THREE.PMREMGenerator(renderer);
@@ -94,7 +98,6 @@ let mixer = null;
 // Load model
 const loader = new GLTFLoader(); // Create a GLTFLoader instance (only once, outside the load function)
 // const modelUrl = "models/chair/mid_century_lounge_chair_1k.gltf"; // Specify the path to your GLTF model
-// const modelUrl = "models/house.glb"; // Specify the path to your GLTF model
 
 const modelUrl = "models/snowy-mountain.glb"; // Specify the path to your GLTF model
 
@@ -102,7 +105,7 @@ const terrain = await loadModel(
   loader,
   modelUrl,
   2400,
-  { x: 50, y: 100, z: 0 },
+  { x: -71, y: 113, z: -8 },
   scene,
   physics,
   { animationPlaybackRate: ANIMATION_PLAYBACK_RATE },
@@ -117,23 +120,136 @@ const character = await loadModel(
   loader,
   charModelUrl,
   1,
-  { x: 0, y: -14, z: -20 },
+  { x: 0, y: -12, z: -20 },
+  scene,
+  physics,
+  { animationPlaybackRate: ANIMATION_PLAYBACK_RATE, lockRotation: true },
+);
+character.root.rotation.set(0, Math.PI / 4, 0); // Rotate the character to face the camera
+console.log("Character loaded:", character);
+
+if (character !== null) {
+  mixer = character.mixer;
+}
+
+const houseModelUrl = "models/house.glb"; // Specify the path to your GLTF model
+const house = await loadModel(
+  loader,
+  houseModelUrl,
+  3700,
+  { x: 20, y: -18, z: -25 },
   scene,
   physics,
   { animationPlaybackRate: ANIMATION_PLAYBACK_RATE },
 );
 
-if (character !== null) {
-  mixer = character.mixer;
-}
+// if (house !== null) {
+//   mixer = house.mixer;
+// }
+
 //responsive canvas
 window.addEventListener("resize", onWindowResize);
 
+///////MOUSE SWIVEL (POINTER LOCK LOOK-AROUND)////////
+const MOUSE_SENSITIVITY = 0.0085;
+const MIN_PITCH_DEG = 10;
+const MAX_PITCH_DEG = 80;
+
+let angle = 0; // target azimuth (radians), driven by mouse X
+let pitch = THREE.MathUtils.degToRad(50); // target pitch (radians), driven by mouse Y
+let cameraPitch = pitch; // smoothed pitch, mirrors cameraAngle's smoothing
+
+renderer.domElement.addEventListener("click", () => {
+  renderer.domElement.requestPointerLock();
+});
+
+document.addEventListener("mousemove", (event) => {
+  if (document.pointerLockElement !== renderer.domElement) {
+    return;
+  }
+
+  angle -= event.movementX * MOUSE_SENSITIVITY;
+  pitch = THREE.MathUtils.clamp(
+    pitch - event.movementY * MOUSE_SENSITIVITY,
+    THREE.MathUtils.degToRad(MIN_PITCH_DEG),
+    THREE.MathUtils.degToRad(MAX_PITCH_DEG),
+  );
+});
+
+///////PLAYER MOVEMENT (WASD, RELATIVE TO CAMERA)////////
+const MOVE_SPEED = 8; // units per second
+const TURN_SMOOTHING = 0.15;
+
+const keysPressed = {};
+window.addEventListener("keydown", (event) => {
+  keysPressed[event.code] = true;
+});
+window.addEventListener("keyup", (event) => {
+  keysPressed[event.code] = false;
+});
+
+const cameraForward = new THREE.Vector3();
+const cameraRight = new THREE.Vector3();
+const moveDirection = new THREE.Vector3();
+const characterFacing = new THREE.Quaternion();
+const targetFacing = new THREE.Quaternion();
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
+// Corrects for the wolf model's snout pointing along local -X instead of
+// +Z; flip the sign (-Math.PI / 2) if orientation is still off by 90°
+const MODEL_FORWARD_OFFSET = Math.PI / 2;
+
 //animation loop
 function animate(time) {
-  timer.update(time);
-  controls.update();
+  timer.update(time); // Update the timer with the current time
+  controls.update(); // Update OrbitControls (if enabled)
 
+  // 3d Person Camera Follow - Smoothly interpolate camera angle and pitch towards target
+  if (character !== null) {
+    cameraAngle = THREE.MathUtils.lerp(cameraAngle, angle, 0.01);
+    cameraPitch = THREE.MathUtils.lerp(cameraPitch, pitch, 0.01);
+    camera.position.setFromSphericalCoords(3, cameraPitch, cameraAngle);
+    camera.position.add(character.root.position);
+    camera.lookAt(character.root.position);
+  }
+
+  // Player movement - WASD relative to camera direction, driven through physics
+  if (character !== null && character.physicsBody !== null) {
+    camera.getWorldDirection(cameraForward);
+    cameraForward.y = 0;
+    cameraForward.normalize();
+    cameraRight.crossVectors(cameraForward, UP_AXIS).normalize();
+
+    moveDirection.set(0, 0, 0);
+    if (keysPressed["KeyW"]) moveDirection.add(cameraForward);
+    if (keysPressed["KeyS"]) moveDirection.sub(cameraForward);
+    if (keysPressed["KeyD"]) moveDirection.add(cameraRight);
+    if (keysPressed["KeyA"]) moveDirection.sub(cameraRight);
+
+    const isMoving = moveDirection.lengthSq() > 0.0001;
+    if (isMoving) {
+      moveDirection.normalize();
+    }
+
+    const currentVelocity = character.physicsBody.linvel();
+    character.physicsBody.setLinvel(
+      {
+        x: moveDirection.x * MOVE_SPEED,
+        y: currentVelocity.y,
+        z: moveDirection.z * MOVE_SPEED,
+      },
+      true,
+    );
+
+    if (isMoving) {
+      const facingAngle =
+        Math.atan2(moveDirection.x, moveDirection.z) + MODEL_FORWARD_OFFSET;
+      targetFacing.setFromAxisAngle(UP_AXIS, facingAngle);
+      characterFacing.slerp(targetFacing, TURN_SMOOTHING);
+      character.physicsBody.setRotation(characterFacing, true);
+    }
+  }
+
+  // Update mixer for model animations
   if (mixer !== null) {
     mixer.update(timer.getDelta());
   }

@@ -97,6 +97,7 @@ export async function loadModel(
     dynamicRestitution = 0.05,
     staticFriction = 0.8,
     staticRestitution = 0.2,
+    lockRotation = false,
   } = options;
 
   try {
@@ -138,7 +139,15 @@ export async function loadModel(
         scene.remove(gltf.scene);
         gltf.scene.position.sub(proxy.position);
         proxy.add(gltf.scene);
-        physicsBody = physics.addMesh(proxy, dynamicMass, dynamicRestitution);
+        physics.addMesh(proxy, dynamicMass, dynamicRestitution);
+        // physics.addMesh doesn't return the body; read it back off the mesh
+        physicsBody = proxy.userData.physics.body;
+
+        if (lockRotation && physicsBody) {
+          // Prevent tipping over on collisions while still allowing turning
+          physicsBody.setEnabledRotations(false, true, false, true);
+        }
+
         root = proxy;
       } else {
         // Static import: bake world transforms so nested/scaled meshes
