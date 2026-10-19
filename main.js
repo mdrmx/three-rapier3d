@@ -16,13 +16,15 @@ scene.background = new THREE.Color(0xbfd1e5);
 const camera = new THREE.PerspectiveCamera(
   75,
   window.innerWidth / window.innerHeight,
-  0.1,
+  0.3,
   3000,
 );
 camera.position.set(0, -3, 5);
+const CAMERA_DISTANCE = 3;
+let cameraDistance = CAMERA_DISTANCE;
 let cameraAngle = 0; // smoothed azimuthal angle (radians) around the character
 
-const renderer = new THREE.WebGLRenderer();
+const renderer = new THREE.WebGLRenderer({ logarithmicDepthBuffer: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -105,7 +107,7 @@ const terrain = await loadModel(
   loader,
   modelUrl,
   2400,
-  { x: -71, y: 113, z: -8 },
+  { x: -1000, y: 120, z: 400 },
   scene,
   physics,
   { animationPlaybackRate: ANIMATION_PLAYBACK_RATE },
@@ -123,7 +125,13 @@ const character = await loadModel(
   { x: 0, y: -12, z: -20 },
   scene,
   physics,
-  { animationPlaybackRate: ANIMATION_PLAYBACK_RATE, lockRotation: true },
+  {
+    animationPlaybackRate: ANIMATION_PLAYBACK_RATE,
+    animationIndex: 3, // "04_Idle" is the starting clip
+    lockRotation: true,
+    // Capsule glides smoothly over ground, unlike mesh-shaped colliders
+    colliderShape: "capsule",
+  },
 );
 character.root.rotation.set(0, Math.PI / 4, 0); // Rotate the character to face the camera
 console.log("Character loaded:", character);
@@ -132,12 +140,99 @@ if (character !== null) {
   mixer = character.mixer;
 }
 
+// Character clips, crossfaded based on input
+const ANIM_FADE_SECONDS = 0.25;
+// No attack clip exists in wolf.glb yet; a cloned run clip stands in. Swap
+// the name (and drop the clone) once a real attack clip is available.
+const ATTACK_CLIP_NAME = "01_Run";
+const ATTACK_TIME_SCALE = 2;
+// 02_walk / 03_creep key several bones (eyes, eye IK, belly, shoulder
+// plates, head) with just two static keyframes holding unauthored default
+// values, unlike idle/run, so those bones snap into a contorted pose.
+// Replace every such static track with idle's value for that bone.
+const clipByName = (name) =>
+  character?.gltf.animations.find((c) => c.name === name) ?? null;
+const BONE_REFERENCE_CLIP = "04_Idle";
+const ROOT_BONE = "Becken_05";
+const ARMATURE_BONE = "Wolf_01";
+const alignStaticTracks = (clip) => {
+  const reference = clipByName(BONE_REFERENCE_CLIP);
+  if (!clip || !reference || clip === reference) return clip;
+  const refTracks = new Map(reference.tracks.map((t) => [t.name, t]));
+  const runRoot = clipByName("01_Run")?.tracks.find(
+    (t) => t.name === `${ARMATURE_BONE}.quaternion`,
+  );
+  clip.tracks = clip.tracks.map((track) => {
+    // Run carries a -90° pitch on the armature root that compensates for the
+    // pelvis orientation; walk/creep omit it, so they tip the wolf forward.
+    if (runRoot && track.name === runRoot.name) return runRoot.clone();
+    const ref = refTracks.get(track.name);
+    const isStatic = track.times.length <= 2;
+    if (!ref || !isStatic || track.name.startsWith(`${ROOT_BONE}.`)) {
+      return track;
+    }
+    const size = track.getValueSize();
+    const TrackType = track.constructor;
+    return new TrackType(
+      track.name,
+      [0],
+      Array.from(ref.values.slice(0, size)),
+    );
+  });
+  return clip;
+};
+const findClip = (name) => {
+  const clip = clipByName(name);
+  return name === "02_walk" || name === "03_creep"
+    ? alignStaticTracks(clip)
+    : clip;
+};
+const makeAction = (clip) => (clip ? character.mixer.clipAction(clip) : null);
+const hasMixer = character?.mixer != null;
+const idleAction = hasMixer ? makeAction(findClip("04_Idle")) : null;
+const walkAction = hasMixer ? makeAction(findClip("02_walk")) : null;
+const runAction = hasMixer ? makeAction(findClip("01_Run")) : null;
+const creepAction = hasMixer ? makeAction(findClip("03_creep")) : null;
+const attackClip = hasMixer ? findClip(ATTACK_CLIP_NAME)?.clone() : null;
+const attackAction = makeAction(attackClip);
+if (attackAction) {
+  attackAction.setLoop(THREE.LoopOnce, 1);
+  attackAction.clampWhenFinished = true;
+}
+let currentAction = idleAction;
+let isAttacking = false;
+for (const action of [idleAction, walkAction, runAction, creepAction]) {
+  action?.setEffectiveTimeScale(ANIMATION_PLAYBACK_RATE);
+}
+const WALK_ANIM_SCALE = 1.15; // tweak to match foot speed to WALK_SPEED
+walkAction?.setEffectiveTimeScale(ANIMATION_PLAYBACK_RATE * WALK_ANIM_SCALE);
+attackAction?.setEffectiveTimeScale(
+  ANIMATION_PLAYBACK_RATE * ATTACK_TIME_SCALE,
+);
+
+function playAction(next) {
+  if (!next || next === currentAction) return;
+  next.reset().play();
+  if (currentAction)
+    next.crossFadeFrom(currentAction, ANIM_FADE_SECONDS, false);
+  currentAction = next;
+}
+
+function triggerAttack() {
+  if (!attackAction || isAttacking) return;
+  isAttacking = true;
+  playAction(attackAction);
+}
+character?.mixer?.addEventListener("finished", (event) => {
+  if (event.action === attackAction) isAttacking = false;
+});
+
 const houseModelUrl = "models/house.glb"; // Specify the path to your GLTF model
 const house = await loadModel(
   loader,
   houseModelUrl,
-  3700,
-  { x: 20, y: -18, z: -25 },
+  4700,
+  { x: -10, y: -22, z: -35 },
   scene,
   physics,
   { animationPlaybackRate: ANIMATION_PLAYBACK_RATE },
@@ -177,12 +272,37 @@ document.addEventListener("mousemove", (event) => {
 });
 
 ///////PLAYER MOVEMENT (WASD, RELATIVE TO CAMERA)////////
-const MOVE_SPEED = 8; // units per second
+const WALK_SPEED = 6; // units per second
+const RUN_SPEED = 16; // hold Shift
+const CREEP_SPEED = 4; // toggled with C
+const JUMP_SPEED = 12;
+const MIN_WALKABLE_NORMAL_Y = 0.6; // steeper surfaces (walls, furniture edges) aren't followed
+const JUMP_BUFFER_MS = 150;
+const JUMP_LOCKOUT_MS = 250; // ignore ground contact right after leaving it
+const GROUND_SNAP_DISTANCE = 0.6; // ray margin below the capsule counted as ground
+const GROUND_STICK_SPEED = 2; // downward bias that keeps the wolf on crests
 const TURN_SMOOTHING = 0.15;
 
 const keysPressed = {};
+let creepToggled = false;
+let jumpPressedAt = -Infinity;
+let airborneUntil = 0;
 window.addEventListener("keydown", (event) => {
   keysPressed[event.code] = true;
+  if (event.repeat) return;
+  if (event.code === "KeyC") creepToggled = !creepToggled;
+  if (event.code === "Space") {
+    event.preventDefault();
+    jumpPressedAt = performance.now();
+  }
+});
+renderer.domElement.addEventListener("mousedown", (event) => {
+  if (
+    event.button === 0 &&
+    document.pointerLockElement === renderer.domElement
+  ) {
+    triggerAttack();
+  }
 });
 window.addEventListener("keyup", (event) => {
   keysPressed[event.code] = false;
@@ -194,6 +314,19 @@ const moveDirection = new THREE.Vector3();
 const characterFacing = new THREE.Quaternion();
 const targetFacing = new THREE.Quaternion();
 const UP_AXIS = new THREE.Vector3(0, 1, 0);
+const TILT_SMOOTHING = 0.1;
+const RENDER_SMOOTH_RATE = 25; // higher = tighter follow of the physics body
+const renderPos = new THREE.Vector3();
+const renderOffset = new THREE.Vector3();
+let renderPosInitialised = false;
+const groundNormal = new THREE.Vector3(0, 1, 0);
+const smoothedNormal = new THREE.Vector3(0, 1, 0);
+const yawQuat = new THREE.Quaternion();
+const tiltWorld = new THREE.Quaternion();
+const tiltLocal = new THREE.Quaternion();
+const modelBaseOffset = character
+  ? character.gltf.scene.position.clone()
+  : new THREE.Vector3();
 // Corrects for the wolf model's snout pointing along local -X instead of
 // +Z; flip the sign (-Math.PI / 2) if orientation is still off by 90°
 const MODEL_FORWARD_OFFSET = Math.PI / 2;
@@ -201,15 +334,57 @@ const MODEL_FORWARD_OFFSET = Math.PI / 2;
 //animation loop
 function animate(time) {
   timer.update(time); // Update the timer with the current time
+  const frameDelta = timer.getDelta();
   controls.update(); // Update OrbitControls (if enabled)
+
+  // Physics steps on its own setInterval, so the body's position advances in
+  // uneven chunks relative to render frames (visible as stutter). Render a
+  // smoothed position instead and offset the model/camera to it.
+  if (character !== null) {
+    const bodyPos = character.root.position;
+    if (!renderPosInitialised) {
+      renderPos.copy(bodyPos);
+      renderPosInitialised = true;
+    }
+    if (renderPos.distanceToSquared(bodyPos) > 25) {
+      renderPos.copy(bodyPos); // teleport/respawn: don't glide
+    } else {
+      renderPos.lerp(bodyPos, 1 - Math.exp(-RENDER_SMOOTH_RATE * frameDelta));
+    }
+  }
 
   // 3d Person Camera Follow - Smoothly interpolate camera angle and pitch towards target
   if (character !== null) {
     cameraAngle = THREE.MathUtils.lerp(cameraAngle, angle, 0.01);
     cameraPitch = THREE.MathUtils.lerp(cameraPitch, pitch, 0.01);
     camera.position.setFromSphericalCoords(3, cameraPitch, cameraAngle);
-    camera.position.add(character.root.position);
-    camera.lookAt(character.root.position);
+    // Pull the camera in when a wall/roof would sit between it and the wolf
+    // so it never clips through the house geometry.
+    if (character.physicsBody !== null) {
+      const origin = character.physicsBody.translation();
+      const camDir = camera.position.clone().normalize();
+      const camHit = physics.world.castRay(
+        new physics.RAPIER.Ray(origin, { x: camDir.x, y: camDir.y, z: camDir.z }),
+        3,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        character.physicsBody,
+      );
+      const targetDistance =
+        camHit !== null
+          ? Math.max(camHit.timeOfImpact - 0.3, 1)
+          : CAMERA_DISTANCE;
+      // Snap in instantly (never clip), ease back out to avoid popping
+      cameraDistance =
+        targetDistance < cameraDistance
+          ? targetDistance
+          : THREE.MathUtils.lerp(cameraDistance, targetDistance, 0.05);
+      camera.position.setLength(cameraDistance);
+    }
+    camera.position.add(renderPos);
+    camera.lookAt(renderPos);
   }
 
   // Player movement - WASD relative to camera direction, driven through physics
@@ -230,12 +405,94 @@ function animate(time) {
       moveDirection.normalize();
     }
 
-    const currentVelocity = character.physicsBody.linvel();
-    character.physicsBody.setLinvel(
+    const sprinting = keysPressed["ShiftLeft"] || keysPressed["ShiftRight"];
+    let moveSpeed = WALK_SPEED;
+    let moveAction = walkAction;
+    if (sprinting) {
+      moveSpeed = RUN_SPEED;
+      moveAction = runAction;
+    } else if (creepToggled) {
+      moveSpeed = CREEP_SPEED;
+      moveAction = creepAction;
+    }
+    if (!isAttacking) playAction(isMoving ? moveAction : idleAction);
+
+    const body = character.physicsBody;
+    const currentVelocity = body.linvel();
+
+    const shape = body.collider(0).shape;
+    const reach =
+      (shape.halfHeight ?? 0) + (shape.radius ?? 0) + GROUND_SNAP_DISTANCE;
+    const p = body.translation();
+    const hit = physics.world.castRayAndGetNormal(
+      new physics.RAPIER.Ray({ x: p.x, y: p.y, z: p.z }, { x: 0, y: -1, z: 0 }),
+      reach,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      body,
+    );
+    // Velocity can't gate this: slope-following gives a positive y while
+    // climbing, so a short post-jump lockout is used instead.
+    const now = performance.now();
+    const onGround = hit !== null && now >= airborneUntil;
+
+    // Pitch/roll the visual model to follow the slope under it. Physics
+    // rotation stays yaw-only; the tilt lives on the child model.
+    if (hit !== null) {
+      groundNormal.set(hit.normal.x, hit.normal.y, hit.normal.z).normalize();
+    } else {
+      groundNormal.copy(UP_AXIS);
+    }
+    smoothedNormal.lerp(groundNormal, TILT_SMOOTHING).normalize();
+    const bodyRot = body.rotation();
+    yawQuat.set(bodyRot.x, bodyRot.y, bodyRot.z, bodyRot.w);
+    tiltWorld.setFromUnitVectors(UP_AXIS, smoothedNormal);
+    // Express the world-space tilt in the body's local frame
+    tiltLocal.copy(yawQuat).invert().multiply(tiltWorld).multiply(yawQuat);
+    const model = character.gltf.scene;
+    model.quaternion.copy(tiltLocal);
+    // Rotate around the body centre instead of the model origin
+    model.position.copy(modelBaseOffset).applyQuaternion(tiltLocal);
+    // Shift the model from the raw physics position to the smoothed one
+    renderOffset
+      .subVectors(renderPos, character.root.position)
+      .applyQuaternion(yawQuat.clone().invert());
+    model.position.add(renderOffset);
+
+    let verticalVelocity = currentVelocity.y;
+    // Jump only while sprinting; a press is buffered briefly so it still
+    // registers if it lands a frame before touching the ground.
+    const jumping =
+      sprinting && onGround && now - jumpPressedAt < JUMP_BUFFER_MS;
+    if (jumping) {
+      verticalVelocity = JUMP_SPEED;
+      airborneUntil = now + JUMP_LOCKOUT_MS;
+      jumpPressedAt = -Infinity;
+    } else if (onGround && isMoving && hit.normal.y > MIN_WALKABLE_NORMAL_Y) {
+      // Follow the surface instead of keeping the upward velocity picked up
+      // on a slope, which launches the wolf off crests; the extra downward
+      // bias keeps it glued to the ground over humps.
+      verticalVelocity =
+        (-(moveDirection.x * hit.normal.x + moveDirection.z * hit.normal.z) /
+          hit.normal.y) *
+          moveSpeed -
+        GROUND_STICK_SPEED;
+    }
+
+    // When idle on the ground, gravity against sloped/mesh terrain makes the
+    // capsule creep downhill, so pin it in place instead.
+    const pinned = onGround && !isMoving && !jumping;
+    body.setGravityScale(pinned ? 0 : 1, true);
+    // Yaw is left free so setRotation works, but contact friction then imparts
+    // spin that never decays; facing is set manually, so kill angular motion.
+    body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+    body.setLinvel(
       {
-        x: moveDirection.x * MOVE_SPEED,
-        y: currentVelocity.y,
-        z: moveDirection.z * MOVE_SPEED,
+        x: moveDirection.x * moveSpeed,
+        y: pinned ? 0 : verticalVelocity,
+        z: moveDirection.z * moveSpeed,
       },
       true,
     );
@@ -251,7 +508,7 @@ function animate(time) {
 
   // Update mixer for model animations
   if (mixer !== null) {
-    mixer.update(timer.getDelta());
+    mixer.update(frameDelta);
   }
 
   renderer.render(scene, camera);

@@ -18,6 +18,67 @@ function hasAnimations(gltf) {
   return Boolean(gltf.animations && gltf.animations.length > 0);
 }
 
+// Adds one collider per mesh onto `body`. `shape` is "trimesh" (concave,
+// exact fit — stable only for static/fixed bodies) or "convex" (convex hull,
+// stable on dynamic bodies). Collider vertices must be expressed in the
+// body's own local frame, not world space, so callers pass whichever
+// transform maps a mesh into that frame.
+function addMeshColliders(
+  physics,
+  body,
+  meshes,
+  getLocalMatrix,
+  friction,
+  restitution,
+  shape,
+) {
+  meshes.forEach((mesh) => {
+    const geometry = mesh.geometry.clone();
+    geometry.applyMatrix4(getLocalMatrix(mesh));
+
+    const positionAttribute = geometry.getAttribute("position");
+    if (!positionAttribute) {
+      return;
+    }
+
+    const vertices = Array.from(positionAttribute.array);
+    let colliderDesc;
+
+    if (shape === "convex") {
+      colliderDesc = physics.RAPIER.ColliderDesc.convexHull(vertices);
+      if (!colliderDesc) {
+        console.warn(
+          "Could not build a convex hull collider for mesh:",
+          mesh.name || mesh,
+        );
+        return;
+      }
+    } else {
+      const indices = geometry.index
+        ? Array.from(geometry.index.array)
+        : Array.from({ length: positionAttribute.count }, (_, index) => index);
+      // Merging duplicate vertices and fixing internal edges removes the
+      // "ghost" bumps a capsule gets from sliding across coplanar triangles
+      const flags = physics.RAPIER.TriMeshFlags;
+      const trimeshFlags = flags
+        ? flags.MERGE_DUPLICATE_VERTICES |
+          flags.DELETE_DEGENERATE_TRIANGLES |
+          flags.FIX_INTERNAL_EDGES
+        : undefined;
+      colliderDesc = physics.RAPIER.ColliderDesc.trimesh(
+        new Float32Array(vertices),
+        new Uint32Array(indices),
+        trimeshFlags,
+      );
+    }
+
+    colliderDesc.setFriction(friction);
+    colliderDesc.setRestitution(restitution);
+
+    physics.world.createCollider(colliderDesc, body);
+  });
+}
+
 // Adds one fixed-body collider per mesh, using each mesh's full matrixWorld
 // (parent transforms + scale) so the collider matches what is actually
 // rendered; physics.addMesh only reads local position/quaternion and
@@ -26,26 +87,17 @@ function addStaticCollidersFromMeshes(physics, meshes, friction, restitution) {
   const bodyDesc = physics.RAPIER.RigidBodyDesc.fixed();
   const body = physics.world.createRigidBody(bodyDesc);
 
-  meshes.forEach((mesh) => {
-    const geometry = mesh.geometry.clone();
-    geometry.applyMatrix4(mesh.matrixWorld);
-
-    const positionAttribute = geometry.getAttribute("position");
-    if (!positionAttribute) {
-      return;
-    }
-
-    const vertices = Array.from(positionAttribute.array);
-    const indices = geometry.index
-      ? Array.from(geometry.index.array)
-      : Array.from({ length: positionAttribute.count }, (_, index) => index);
-
-    const colliderDesc = physics.RAPIER.ColliderDesc.trimesh(vertices, indices);
-    colliderDesc.setFriction(friction);
-    colliderDesc.setRestitution(restitution);
-
-    physics.world.createCollider(colliderDesc, body);
-  });
+  // The fixed body sits at identity/origin, so world space IS the body's
+  // local frame here; no extra transform needed per mesh.
+  addMeshColliders(
+    physics,
+    body,
+    meshes,
+    (mesh) => mesh.matrixWorld,
+    friction,
+    restitution,
+    "trimesh",
+  );
 
   return body;
 }
@@ -66,15 +118,34 @@ function buildBoxProxy(root) {
     Math.max(size.z, 0.01),
   );
   const material = new THREE.MeshBasicMaterial({
-    visible: true,
+    visible: false,
     wireframe: true,
     color: 0xff0000,
   });
   const proxy = new THREE.Mesh(geometry, material);
 
   proxy.position.copy(center);
+  proxy.userData.size = size;
 
   return proxy;
+}
+
+// Builds a single Y-aligned capsule collider desc sized to fit `size`
+// (the model's world-space bounds). Radius comes from the wider horizontal
+// footprint; half-height fills the remaining vertical extent.
+function buildCapsuleColliderDesc(physics, size, friction, restitution) {
+  // Cap the radius so the capsule's bottom (halfHeight + radius) never
+  // exceeds half the model height; a long, low animal like the wolf would
+  // otherwise get a capsule taller than the model and hover above the ground.
+  const maxRadius = Math.max(size.y / 2 - 0.01, 0.01);
+  const radius = Math.min(Math.max(size.x, size.z, 0.01) / 2, maxRadius);
+  const halfHeight = Math.max(size.y / 2 - radius, 0.01);
+
+  const colliderDesc = physics.RAPIER.ColliderDesc.capsule(halfHeight, radius);
+  colliderDesc.setFriction(friction);
+  colliderDesc.setRestitution(restitution);
+
+  return colliderDesc;
 }
 
 // Loads a GLTF/GLB model, adds it to the scene, and wires up physics.
@@ -98,6 +169,7 @@ export async function loadModel(
     staticFriction = 0.8,
     staticRestitution = 0.2,
     lockRotation = false,
+    colliderShape = "box", // "box" (proxy), "trimesh", "convex", or "capsule"
   } = options;
 
   try {
@@ -142,6 +214,43 @@ export async function loadModel(
         physics.addMesh(proxy, dynamicMass, dynamicRestitution);
         // physics.addMesh doesn't return the body; read it back off the mesh
         physicsBody = proxy.userData.physics.body;
+
+        if (colliderShape !== "box" && physicsBody) {
+          // Swap the default box collider for one built from the actual
+          // mesh geometry, attached to the same rigid body so it keeps
+          // moving/turning with it. Trimesh is unstable on dynamic bodies,
+          // and mesh-shaped colliders (trimesh/convex) jitter on a moving
+          // character since their underside is uneven; capsule is the
+          // stable, smooth-gliding choice for characters.
+          const boxCollider = proxy.userData.physics.collider;
+          if (boxCollider) {
+            physics.world.removeCollider(boxCollider, true);
+            proxy.userData.physics.collider = null;
+          }
+
+          if (colliderShape === "capsule") {
+            const capsuleDesc = buildCapsuleColliderDesc(
+              physics,
+              proxy.userData.size,
+              staticFriction,
+              staticRestitution,
+            );
+            physics.world.createCollider(capsuleDesc, physicsBody);
+          } else {
+            proxy.updateMatrixWorld(true);
+            const bodyWorldToLocal = proxy.matrixWorld.clone().invert();
+
+            addMeshColliders(
+              physics,
+              physicsBody,
+              findAllMeshes(gltf.scene),
+              (mesh) => bodyWorldToLocal.clone().multiply(mesh.matrixWorld),
+              staticFriction,
+              staticRestitution,
+              colliderShape,
+            );
+          }
+        }
 
         if (lockRotation && physicsBody) {
           // Prevent tipping over on collisions while still allowing turning
