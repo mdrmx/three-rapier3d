@@ -233,7 +233,7 @@ export async function loadModel(
               physics,
               proxy.userData.size,
               staticFriction,
-              staticRestitution,
+              dynamicRestitution,
             );
             physics.world.createCollider(capsuleDesc, physicsBody);
           } else {
@@ -246,7 +246,7 @@ export async function loadModel(
               findAllMeshes(gltf.scene),
               (mesh) => bodyWorldToLocal.clone().multiply(mesh.matrixWorld),
               staticFriction,
-              staticRestitution,
+              dynamicRestitution,
               colliderShape,
             );
           }

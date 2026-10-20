@@ -21,6 +21,8 @@ const camera = new THREE.PerspectiveCamera(
 );
 camera.position.set(0, -3, 5);
 const CAMERA_DISTANCE = 3;
+const CAMERA_CLEARANCE = 0.3; // gap kept between camera and obstruction
+const MIN_CAMERA_DISTANCE = 0.35; // keeps the wolf outside the near plane
 let cameraDistance = CAMERA_DISTANCE;
 let cameraAngle = 0; // smoothed azimuthal angle (radians) around the character
 
@@ -133,7 +135,10 @@ const character = await loadModel(
     colliderShape: "capsule",
   },
 );
-character.root.rotation.set(0, Math.PI / 4, 0); // Rotate the character to face the camera
+if (character !== null) {
+  // Rotate the character to face the camera
+  character.root.rotation.set(0, Math.PI / 4, 0);
+}
 console.log("Character loaded:", character);
 
 if (character !== null) {
@@ -307,6 +312,11 @@ renderer.domElement.addEventListener("mousedown", (event) => {
 window.addEventListener("keyup", (event) => {
   keysPressed[event.code] = false;
 });
+// keyup is missed if focus is lost while a key is held
+window.addEventListener("blur", () => {
+  for (const code of Object.keys(keysPressed)) keysPressed[code] = false;
+  jumpPressedAt = -Infinity;
+});
 
 const cameraForward = new THREE.Vector3();
 const cameraRight = new THREE.Vector3();
@@ -361,7 +371,7 @@ function animate(time) {
     // Pull the camera in when a wall/roof would sit between it and the wolf
     // so it never clips through the house geometry.
     if (character.physicsBody !== null) {
-      const origin = character.physicsBody.translation();
+      const origin = renderPos;
       const camDir = camera.position.clone().normalize();
       const camHit = physics.world.castRay(
         new physics.RAPIER.Ray(origin, { x: camDir.x, y: camDir.y, z: camDir.z }),
@@ -374,7 +384,7 @@ function animate(time) {
       );
       const targetDistance =
         camHit !== null
-          ? Math.max(camHit.timeOfImpact - 0.3, 1)
+          ? Math.max(camHit.timeOfImpact - CAMERA_CLEARANCE, MIN_CAMERA_DISTANCE)
           : CAMERA_DISTANCE;
       // Snap in instantly (never clip), ease back out to avoid popping
       cameraDistance =
@@ -483,7 +493,11 @@ function animate(time) {
 
     // When idle on the ground, gravity against sloped/mesh terrain makes the
     // capsule creep downhill, so pin it in place instead.
-    const pinned = onGround && !isMoving && !jumping;
+    // Only pin on real contact; inside the snap margin the wolf must still
+    // fall, otherwise it would hover.
+    const touching =
+      hit !== null && hit.timeOfImpact <= reach - GROUND_SNAP_DISTANCE + 0.1;
+    const pinned = onGround && touching && !isMoving && !jumping;
     body.setGravityScale(pinned ? 0 : 1, true);
     // Yaw is left free so setRotation works, but contact friction then imparts
     // spin that never decays; facing is set manually, so kill angular motion.
